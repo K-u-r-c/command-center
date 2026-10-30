@@ -22,7 +22,8 @@ def find_running_pid():
         cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
     except Exception:
         return None
-    if pid == os.getpid() or b"command_center" not in cmdline:
+    # command_center.py or the ~/.local/bin/command-center symlink
+    if pid == os.getpid() or not re.search(rb"command[_-]center", cmdline):
         return None
     return pid
 
@@ -44,7 +45,10 @@ gi.require_version("GtkLayerShell", "0.1")
 from gi.repository import Gdk, GdkPixbuf, Gio, GLib, Gtk, GtkLayerShell, Pango
 
 HOME = Path.home()
-LAYOUT_FILE = HOME / ".config/hypr/command_center_layout.json"
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "command-center"
+LAYOUT_FILE = CONFIG_DIR / "layout.json"
+# Layout saved before command center moved out of ~/.config/hypr – read once, then written to LAYOUT_FILE
+OLD_LAYOUT_FILE = HOME / ".config/hypr/command_center_layout.json"
 # Bump when tile order/defaults change so stale saved positions are dropped
 LAYOUT_VERSION = 4
 # Preferred (width, max height) per tile; rows are flowed to fit whichever screen opens it
@@ -56,6 +60,8 @@ TILE_PREFS = {
     "wallpaper": (480, 650),
     "system": (420, 400),
 }
+# Wallpaper tile needs wallpaper.sh from https://github.com/K-u-r-c/hypr (hyprpaper/mpvpaper);
+# without it the tile only lists files and says what is missing
 WALL_SCRIPT = HOME / ".config/hypr/wallpaper.sh"
 WALL_DIR = HOME / "Pictures/wallpapers"
 THUMB_DIR = HOME / ".cache/wallpaper-thumbs"
@@ -67,7 +73,7 @@ APP_USAGE_FILE = HOME / ".cache/command-center-apps.json"
 DDC_CACHE = HOME / ".cache/command-center-ddc.json"
 LAUNCHER_MAX_RESULTS = 30
 SEARCH_W = 760
-TERMINAL = "alacritty"
+TERMINAL = os.environ.get("TERMINAL", "alacritty")
 
 THUMB_DIR.mkdir(parents=True, exist_ok=True)
 SHOT_THUMB_DIR.mkdir(parents=True, exist_ok=True)
@@ -384,12 +390,16 @@ def run_cmd(args, timeout=2.5):
 
 
 def detect_monitors():
-    # [(name, w, h)], główny monitor (primary-monitor.sh) pierwszy – nic na sztywno
+    # [(name, w, h)], główny monitor pierwszy – nic na sztywno. Główny jak w hypr/primary-monitor.sh:
+    # $PRIMARY_MONITOR (env z monitors.conf), a gdy nie ustawiony/niepodłączony – największy
     try:
         mons = json.loads(run_cmd(["hyprctl", "monitors", "-j"]))
     except Exception:
         return []
-    primary = run_cmd([str(HOME / ".config/hypr/primary-monitor.sh")])
+    names = [m.get("name") for m in mons]
+    primary = os.environ.get("PRIMARY_MONITOR")
+    if primary not in names:
+        primary = max(mons, key=lambda m: m.get("width", 0) * m.get("height", 0), default={}).get("name")
     mons.sort(key=lambda m: m.get("name") != primary)
     return [(m["name"], int(m.get("width", 0)), int(m.get("height", 0))) for m in mons]
 
@@ -1073,7 +1083,8 @@ class CommandCenterApp:
 
     def read_layout_file(self):
         try:
-            data = json.loads(LAYOUT_FILE.read_text())
+            src = LAYOUT_FILE if LAYOUT_FILE.exists() else OLD_LAYOUT_FILE
+            data = json.loads(src.read_text())
         except Exception:
             return {}
         return data if data.get("_version") == LAYOUT_VERSION else {}
@@ -1081,6 +1092,7 @@ class CommandCenterApp:
     def write_layout_file(self, data):
         data["_version"] = LAYOUT_VERSION
         try:
+            LAYOUT_FILE.parent.mkdir(parents=True, exist_ok=True)
             LAYOUT_FILE.write_text(json.dumps(data, indent=2))
         except Exception:
             pass
@@ -2118,7 +2130,7 @@ class CommandCenterApp:
         exts = {".mp4", ".webm", ".mkv", ".gif", ".jpg", ".jpeg", ".png", ".webp"}
         all_files = sorted(
             [p for p in WALL_DIR.iterdir() if p.is_file() and p.suffix.lower() in exts]
-        )
+        ) if WALL_DIR.is_dir() else []
         uw = [p for p in all_files if p.name.startswith("uw-")]
         fhd = [p for p in all_files if not p.name.startswith("uw-")]
         ref = self.wall_monitors[0] if target_mon == "ALL" else target_mon
@@ -2195,6 +2207,9 @@ class CommandCenterApp:
             return
         wpath = self.wallpapers[self.wall_sel]
         target_mon = self.wall_monitors[self.wall_mon_idx]
+        if not os.access(WALL_SCRIPT, os.X_OK):
+            self.set_status("NO ~/.config/hypr/wallpaper.sh – GET IT FROM github.com/K-u-r-c/hypr")
+            return
         subprocess.Popen([str(WALL_SCRIPT), "set", target_mon, str(wpath)])
         self.set_status(f"WALLPAPER ({target_mon}): {wpath.stem}")
         GLib.timeout_add(250, self.refresh_wallpapers)
