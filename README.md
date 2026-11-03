@@ -3,7 +3,7 @@
 Pełnoekranowy HUD dla **Hyprlanda** (GTK3 + gtk-layer-shell) w terminalowym, czarno-białym stylu. SUPER+TAB go otwiera, drugie SUPER+TAB albo Esc zamyka.
 
 - **wyszukiwarka aplikacji** w stylu Spotlight (zaczynasz pisać, strzałki wybierają, Enter uruchamia),
-- kafelki: **audio** (wyjścia i głośność aplikacji), **jasność** monitorów (DDC/CI), **Bluetooth**, **zrzuty ekranu**, **tapety**, **system** (CPU, RAM, GPU, VRAM, dysk i liczba aktualizacji przez `checkupdates` + `paru`),
+- kafelki: **audio** (wyjścia i głośność aplikacji), **jasność** monitorów (DDC/CI) i przełącznik **HDR** (`[T]`, wymaga `hdr.sh` z [hypr](https://github.com/K-u-r-c/hypr)), **Bluetooth**, **zrzuty ekranu**, **tapety**, **system** (CPU, RAM, GPU, VRAM, dysk i liczba aktualizacji przez `checkupdates` + `paru`),
 - kafelki da się przeciągać, a układ zapisuje się osobno dla każdej rozdzielczości.
 
 Działa jako demon (`--daemon`), więc otwiera się od razu, bez mignięcia.

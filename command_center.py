@@ -63,6 +63,8 @@ TILE_PREFS = {
 # Wallpaper tile needs wallpaper.sh from https://github.com/K-u-r-c/hypr (hyprpaper/mpvpaper);
 # without it the tile only lists files and says what is missing
 WALL_SCRIPT = HOME / ".config/hypr/wallpaper.sh"
+# HDR toggle in the brightness tile needs hdr.sh from the same repo; without it the button is hidden
+HDR_SCRIPT = HOME / ".config/hypr/hdr.sh"
 WALL_DIR = HOME / "Pictures/wallpapers"
 THUMB_DIR = HOME / ".cache/wallpaper-thumbs"
 SHOT_THUMB_DIR = HOME / ".cache/screenshot-thumbs"
@@ -773,6 +775,7 @@ class CommandCenterApp:
         self.audio_sel = 0
         self.audio_sinks = []
         self.audio_default_sink = ""
+        self.audio_polling = False
 
         self.screenshots = []
         self.shot_sel = 0
@@ -815,6 +818,8 @@ class CommandCenterApp:
         self.bright_inflight = set()
         self.bright_flush_id = None
         self.bright_reading = False
+        self.hdr_state = None
+        self.hdr_busy = False
 
         self.sys_busy = False
         self.sys_rows = {}
@@ -827,6 +832,8 @@ class CommandCenterApp:
         self.upd_counts = None
 
         self.build_tiles()
+        for tile in self.tiles.values():
+            tile.connect_after("size-allocate", self.on_tile_allocated)
         self.build_hud()
         self.build_search()
         self.load_layout()
@@ -870,6 +877,7 @@ class CommandCenterApp:
             self.refresh_launcher,
             self.refresh_audio,
             self.refresh_brightness,
+            self.refresh_hdr,
             self.refresh_bluetooth,
             self.refresh_screenshots,
             self.refresh_wallpapers,
@@ -936,7 +944,7 @@ class CommandCenterApp:
 
     def hide_overlay(self):
         self.is_visible = False
-        self.dragging_tile = None
+        self.sync_dragged_tile()
         self.resizing_tile = None
         if self.daemon:
             if self.win is not None:
@@ -975,11 +983,30 @@ class CommandCenterApp:
         ny = max(64, min(self.screen_h - th - 10, canvas_y - self.drag_offset[1]))
         tile.x = nx
         tile.y = ny
-        self.fixed.move(tile, tile.x, tile.y)
+        # Move only the tile's own GdkWindow while dragging: Fixed.move() relayouts and repaints
+        # the whole full-screen window every frame (~24 ms at 4K -> ~30 fps). The widget position
+        # is synced once on release (end_tile_drag) and kept by on_tile_allocated meanwhile.
+        gw = tile.get_window()
+        if gw:
+            gw.move(nx, ny)
+        else:
+            self.fixed.move(tile, tile.x, tile.y)
+
+    def on_tile_allocated(self, tile, _alloc):
+        # A relayout mid-drag (e.g. system stats updating) would snap the window back to the
+        # stale widget position; put it back under the cursor
+        if tile is self.dragging_tile and tile.get_window():
+            tile.get_window().move(tile.x, tile.y)
+
+    def sync_dragged_tile(self):
+        tile = self.dragging_tile
+        self.dragging_tile = None
+        if tile:
+            self.fixed.move(tile, tile.x, tile.y)
+        return tile
 
     def end_tile_drag(self):
-        if self.dragging_tile:
-            self.dragging_tile = None
+        if self.sync_dragged_tile():
             self.save_layout()
 
     def start_tile_resize(self, tile: DraggableTile, canvas_x: int, canvas_y: int):
@@ -1028,12 +1055,18 @@ class CommandCenterApp:
         return False
 
     def detect_focused_monitor_size(self):
+        # Logical size (what GTK lays out in): hyprctl gives physical pixels, so divide by the scale
+        # and swap for rotated monitors – otherwise at scale 1.5 tiles land off-screen and the
+        # window is sized past the screen (a huge buffer to repaint every frame)
         out = run_cmd(["hyprctl", "monitors", "-j"])
         try:
             mons = json.loads(out)
             for m in mons:
                 if m.get("focused"):
-                    return int(m.get("width", 1920)), int(m.get("height", 1080))
+                    scale = float(m.get("scale") or 1) or 1
+                    w = round(int(m.get("width", 1920)) / scale)
+                    h = round(int(m.get("height", 1080)) / scale)
+                    return (h, w) if int(m.get("transform", 0)) % 2 else (w, h)
         except Exception:
             pass
         return 1920, 1080
@@ -1439,11 +1472,18 @@ class CommandCenterApp:
         bright_hint = Gtk.Label(label="Hardware brightness (DDC/CI)")
         bright_hint.get_style_context().add_class("row-sub")
         bright_hint.set_xalign(0)
+        bright_hint.set_ellipsize(Pango.EllipsizeMode.END)
         bright_bar.pack_start(bright_hint, True, True, 0)
         redetect_btn = Gtk.Button(label="[D] REDETECT")
         redetect_btn.get_style_context().add_class("mono-btn")
         redetect_btn.connect("clicked", lambda *_: (self.focus_tile("brightness"), self.detect_displays(force=True)))
         bright_bar.pack_end(redetect_btn, False, False, 0)
+        self.hdr_btn = Gtk.Button(label="[T] HDR: --")
+        self.hdr_btn.get_style_context().add_class("mono-btn")
+        self.hdr_btn.set_tooltip_text("HDR on the active monitor (hypr/hdr.sh)")
+        self.hdr_btn.connect("clicked", lambda *_: (self.focus_tile("brightness"), self.toggle_hdr()))
+        self.hdr_btn.set_no_show_all(True)
+        bright_bar.pack_end(self.hdr_btn, False, False, 0)
         t_bright.body.pack_start(bright_bar, False, False, 0)
 
         self.bright_scroll = Gtk.ScrolledWindow()
@@ -1712,7 +1752,14 @@ class CommandCenterApp:
 
     # ---------------- AUDIO MIXER LOGIC ----------------
     def query_audio_state(self):
+        sinks, default, items = self.fetch_audio_state()
+        self.audio_sinks, self.audio_default_sink = sinks, default
+        return items
+
+    def fetch_audio_state(self):
+        # No side effects, so it can run in a worker thread: (sinks, default sink, items)
         items = []
+        out_sinks, out_default = list(self.audio_sinks), self.audio_default_sink
         sinks_raw = run_cmd(["pactl", "-f", "json", "list", "sinks"])
         default_sink = run_cmd(["pactl", "get-default-sink"])
         try:
@@ -1722,10 +1769,10 @@ class CommandCenterApp:
                 if s.get("name") == default_sink:
                     chosen = s
                     break
-            self.audio_sinks = [
+            out_sinks = [
                 (s.get("name", ""), s.get("description") or s.get("name", "")) for s in sinks
             ]
-            self.audio_default_sink = chosen.get("name", "") if chosen else ""
+            out_default = chosen.get("name", "") if chosen else ""
             if chosen:
                 vol_dict = chosen.get("volume", {})
                 first_ch = next(iter(vol_dict.values()), {})
@@ -1774,13 +1821,35 @@ class CommandCenterApp:
                 )
         except Exception:
             pass
-        return items
+        return out_sinks, out_default, items
 
     def audio_signature(self):
         return (self.audio_default_sink, tuple(n for n, _ in self.audio_sinks), len(self.audio_items))
 
-    def refresh_audio(self):
-        self.audio_items = self.query_audio_state()
+    def poll_audio(self):
+        # pactl runs off the main thread: three blocking calls every tick made the whole window hitch
+        if self.audio_polling:
+            return
+        self.audio_polling = True
+
+        def _worker():
+            GLib.idle_add(self._finish_audio_poll, self.fetch_audio_state())
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _finish_audio_poll(self, state):
+        self.audio_polling = False
+        sinks, default, items = state
+        # Re-render on any sink/stream change (BT device connecting, default switched elsewhere)
+        if self.is_visible and (default, tuple(n for n, _ in sinks), len(items)) != self.audio_signature():
+            self.refresh_audio(state)
+        return False
+
+    def refresh_audio(self, state=None):
+        if state is None:
+            self.audio_items = self.query_audio_state()
+        else:
+            self.audio_sinks, self.audio_default_sink, self.audio_items = state
         if self.audio_sel >= len(self.audio_items):
             self.audio_sel = max(0, len(self.audio_items) - 1)
 
@@ -2177,6 +2246,9 @@ class CommandCenterApp:
             lbl = Gtk.Label(label=f"{act_str}{clean_name}")
             lbl.get_style_context().add_class("row-title")
             lbl.set_xalign(0)
+            # long names would otherwise widen the tile past its size (and the window past the screen)
+            lbl.set_ellipsize(Pango.EllipsizeMode.END)
+            lbl.set_tooltip_text(clean_name)
             vbox.pack_start(lbl, False, False, 0)
 
             ratio = "21:9" if wpath.name.startswith("uw-") else "16:9"
@@ -2398,6 +2470,49 @@ class CommandCenterApp:
                 }
             )
         return displays
+
+    def refresh_hdr(self):
+        if not HDR_SCRIPT.exists():
+            self.hdr_btn.hide()
+            return
+        if self.hdr_busy:
+            return
+
+        def _worker():
+            GLib.idle_add(self._finish_hdr, run_cmd([str(HDR_SCRIPT), "status"]), None)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def toggle_hdr(self):
+        if self.hdr_busy or not HDR_SCRIPT.exists():
+            return
+        self.hdr_busy = True
+        self.hdr_btn.set_label("[T] HDR: ...")
+        self.set_status("SWITCHING HDR...")
+
+        def _worker():
+            # reload + modeset takes a moment, the screen blinks once
+            try:
+                res = subprocess.run([str(HDR_SCRIPT), "toggle"], capture_output=True, text=True, timeout=15)
+                out, err = res.stdout.strip(), res.stderr.strip()
+            except Exception as e:
+                out, err = "", str(e)
+            GLib.idle_add(self._finish_hdr, out, err)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _finish_hdr(self, state, err):
+        # err is None for a plain status read, a (possibly empty) string after a toggle
+        self.hdr_busy = False
+        state = state.splitlines()[-1] if state else ""
+        known = state in ("on", "off")
+        if known:
+            self.hdr_state = state
+        self.hdr_btn.set_label(f"[T] HDR: {state.upper()}" if known else "[T] HDR: --")
+        self.hdr_btn.show()
+        if err is not None:
+            self.set_status(f"HDR {state.upper()}" if known else f"HDR: {(err.splitlines() or ['failed'])[-1][:60]}")
+        return False
 
     def refresh_brightness(self):
         if self.bright_displays:
@@ -2845,11 +2960,7 @@ class CommandCenterApp:
         if not self.is_visible:
             return True
         self.refresh_system()
-        # Re-render on any sink/stream change (BT device connecting, default switched elsewhere)
-        old_sig = self.audio_signature()
-        new_items = self.query_audio_state()
-        if (self.audio_default_sink, tuple(n for n, _ in self.audio_sinks), len(new_items)) != old_sig:
-            self.refresh_audio()
+        self.poll_audio()
         return True
 
     def on_key_press(self, _widget, event):
@@ -2956,6 +3067,9 @@ class CommandCenterApp:
                 return True
             if key in ("d", "D"):
                 self.detect_displays(force=True)
+                return True
+            if key in ("t", "T"):
+                self.toggle_hdr()
                 return True
 
         elif active_tile_id == "screenshots":
