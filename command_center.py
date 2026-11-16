@@ -59,6 +59,7 @@ TILE_PREFS = {
     "screenshots": (470, 650),
     "wallpaper": (480, 650),
     "system": (420, 400),
+    "network": (480, 650),
 }
 # Wallpaper tile needs wallpaper.sh from https://github.com/K-u-r-c/hypr (hyprpaper/mpvpaper);
 # without it the tile only lists files and says what is missing
@@ -67,6 +68,8 @@ WALL_SCRIPT = HOME / ".config/hypr/wallpaper.sh"
 HDR_SCRIPT = HOME / ".config/hypr/hdr.sh"
 # RGB toggle in the system tile (rainbow / off via OpenRGB profiles); without it the button is hidden
 RGB_SCRIPT = HOME / ".local/bin/rgb-mode"
+# Network tile talks to NetworkManager through nmcli; without it the tile just says so
+NMCLI = shutil.which("nmcli")
 WALL_DIR = HOME / "Pictures/wallpapers"
 THUMB_DIR = HOME / ".cache/wallpaper-thumbs"
 SHOT_THUMB_DIR = HOME / ".cache/screenshot-thumbs"
@@ -391,6 +394,19 @@ def run_cmd(args, timeout=2.5):
         return res.stdout.strip()
     except Exception:
         return ""
+
+
+def nm_fields(line):
+    # nmcli -t joins fields with ':' and escapes ':' / '\' inside values (SSIDs, BSSIDs)
+    return [re.sub(r"\\(.)", r"\1", f) for f in re.split(r"(?<!\\):", line)]
+
+
+def fmt_rate(bps):
+    for unit in ("B/s", "KB/s", "MB/s"):
+        if bps < 1000:
+            return f"{bps:.0f} {unit}" if unit == "B/s" else f"{bps:.1f} {unit}"
+        bps /= 1000
+    return f"{bps:.1f} GB/s"
 
 
 def detect_monitors():
@@ -766,7 +782,7 @@ class CommandCenterApp:
         self.bg_ev.add(self.fixed)
 
         self.focused_tile_idx = 0
-        self.tile_order = ["audio", "brightness", "bluetooth", "screenshots", "wallpaper", "system"]
+        self.tile_order = ["audio", "brightness", "bluetooth", "screenshots", "wallpaper", "system", "network"]
         self.z_order = list(self.tile_order)
         self.tiles = {}
         self.left_ev = None
@@ -799,6 +815,18 @@ class CommandCenterApp:
         self.bt_scanning = False
         self.bt_devices = []
         self.bt_sel = 0
+
+        self.net_state = {}
+        self.net_items = []
+        self.net_sel = 0
+        self.net_querying = False
+        self.net_requery = False
+        self.net_scanning = False
+        self.net_action_busy = False
+        self.net_pw_ssid = None
+        self.net_forget_pending = (None, 0.0)
+        self.net_rate_prev = None
+        self.net_ticks = 0
 
         self.launch_apps = []
         self.launch_results = []
@@ -883,6 +911,7 @@ class CommandCenterApp:
             self.refresh_hdr,
             self.refresh_rgb,
             self.refresh_bluetooth,
+            self.refresh_network,
             self.refresh_screenshots,
             self.refresh_wallpapers,
             self.refresh_system,
@@ -948,6 +977,7 @@ class CommandCenterApp:
 
     def hide_overlay(self):
         self.is_visible = False
+        self.cancel_net_password()
         self.sync_dragged_tile()
         self.resizing_tile = None
         if self.daemon:
@@ -1236,7 +1266,7 @@ class CommandCenterApp:
             "• Ctrl + Arrows/HJKL : Resize active tile via keyboard",
             "• Type / '/'         : Search apps, ENTER launches",
             "• TAB / Shift+TAB    : Search bar <-> tiles",
-            "• 1-6 / Alt+1-6      : Jump to tile",
+            "• 1-7 / Alt+1-7      : Jump to tile",
             "• ↑/↓ or J/K         : Select item in tile",
             "• ←/→ or H/L         : Volume / Brightness -/+5%, Monitor",
             "• ENTER              : Apply / Copy / Connect",
@@ -1244,6 +1274,8 @@ class CommandCenterApp:
             "• O / Shift+O (Audio): Next / previous output device",
             "• D (Brightness)     : Re-detect displays",
             "• P / S (Bluetooth)  : BT Power ON/OFF / Scan",
+            "• I / W / S (Network): Internet / Wi-Fi ON/OFF / Scan",
+            "• ENTER / F (Network): Connect-disconnect / Forget",
             "• O / DEL (Screenshot): Open / Delete screenshot",
             "• ENTER / U (System) : Open btop / Run system update",
             "• [_] / Ctrl + M     : Minimize / restore tile",
@@ -1306,6 +1338,7 @@ class CommandCenterApp:
         self.fixed.move(self.results_ev, x, y + 62)
 
     def activate_search(self):
+        self.cancel_net_password()
         self.search_active = True
         self.update_focus_visuals()
 
@@ -1562,6 +1595,76 @@ class CommandCenterApp:
 
         self.tiles["system"] = t_sys
         self.fixed.put(t_sys, t_sys.x, t_sys.y)
+
+        # 7. NETWORK TILE (NetworkManager / nmcli)
+        nx, ny, nw, nh = pos["network"]
+        t_net = DraggableTile(self, "network", self.tile_title("network", "NETWORK"), nw, nh, nx, ny)
+        net_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.net_power_btn = Gtk.Button(label="[I] INTERNET: --")
+        self.net_power_btn.get_style_context().add_class("mono-btn")
+        self.net_power_btn.set_tooltip_text("All networking on / off (nmcli networking)")
+        self.net_power_btn.connect("clicked", lambda *_: (self.focus_tile("network"), self.toggle_networking()))
+        net_bar.pack_start(self.net_power_btn, True, True, 0)
+
+        self.net_wifi_btn = Gtk.Button(label="[W] WI-FI: --")
+        self.net_wifi_btn.get_style_context().add_class("mono-btn")
+        self.net_wifi_btn.set_tooltip_text("Wi-Fi radio on / off (nmcli radio wifi)")
+        self.net_wifi_btn.connect("clicked", lambda *_: (self.focus_tile("network"), self.toggle_wifi()))
+        self.net_wifi_btn.set_no_show_all(True)  # shown by render_network when there is a Wi-Fi card
+        net_bar.pack_start(self.net_wifi_btn, True, True, 0)
+
+        self.net_scan_btn = Gtk.Button(label="[S] SCAN")
+        self.net_scan_btn.get_style_context().add_class("mono-btn")
+        self.net_scan_btn.connect("clicked", lambda *_: (self.focus_tile("network"), self.trigger_net_scan()))
+        net_bar.pack_start(self.net_scan_btn, False, False, 0)
+        t_net.body.pack_start(net_bar, False, False, 0)
+
+        # Current link: device, connection, address, connectivity, live throughput
+        self.net_info_lbl = Gtk.Label(label="")
+        self.net_info_lbl.get_style_context().add_class("row-title")
+        self.net_info_lbl.set_xalign(0)
+        self.net_info_lbl.set_ellipsize(Pango.EllipsizeMode.END)
+        t_net.body.pack_start(self.net_info_lbl, False, False, 0)
+        self.net_rate_lbl = Gtk.Label(label="")
+        self.net_rate_lbl.get_style_context().add_class("row-sub")
+        self.net_rate_lbl.set_xalign(0)
+        t_net.body.pack_start(self.net_rate_lbl, False, False, 0)
+
+        # Password prompt for a new secured Wi-Fi network – hidden until needed
+        self.net_pw_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self.net_pw_box.get_style_context().add_class("item-row-selected")
+        self.net_pw_lbl = Gtk.Label(label="")
+        self.net_pw_lbl.get_style_context().add_class("row-title")
+        self.net_pw_lbl.set_xalign(0)
+        self.net_pw_lbl.set_ellipsize(Pango.EllipsizeMode.END)
+        self.net_pw_box.pack_start(self.net_pw_lbl, False, False, 0)
+        pw_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.net_pw_entry = Gtk.Entry()
+        self.net_pw_entry.set_visibility(False)
+        self.net_pw_entry.set_invisible_char("*")
+        self.net_pw_entry.set_placeholder_text("password")
+        pw_row.pack_start(self.net_pw_entry, True, True, 0)
+        pw_ok = Gtk.Button(label="[ENTER] JOIN")
+        pw_ok.get_style_context().add_class("mono-btn")
+        pw_ok.connect("clicked", lambda *_: self.submit_net_password())
+        pw_row.pack_start(pw_ok, False, False, 0)
+        pw_cancel = Gtk.Button(label="[ESC]")
+        pw_cancel.get_style_context().add_class("mono-btn")
+        pw_cancel.connect("clicked", lambda *_: self.cancel_net_password())
+        pw_row.pack_start(pw_cancel, False, False, 0)
+        self.net_pw_box.pack_start(pw_row, False, False, 0)
+        self.net_pw_box.set_no_show_all(True)
+        t_net.body.pack_start(self.net_pw_box, False, False, 0)
+
+        self.net_scroll = Gtk.ScrolledWindow()
+        self.net_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.net_scroll.connect("button-press-event", lambda *_: self.focus_tile("network") or False)
+        self.net_list_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.net_scroll.add(self.net_list_box)
+        t_net.body.pack_start(self.net_scroll, True, True, 0)
+
+        self.tiles["network"] = t_net
+        self.fixed.put(t_net, t_net.x, t_net.y)
 
     # ---------------- APP LAUNCHER LOGIC ----------------
     def load_launcher_apps(self):
@@ -2457,6 +2560,377 @@ class CommandCenterApp:
         self.set_status(f"BT UPDATED: {name}")
         return False
 
+    # ---------------- NETWORK (NetworkManager) LOGIC ----------------
+    @staticmethod
+    def query_network_state():
+        # Runs in a worker thread: only nmcli calls, no GTK
+        if not NMCLI:
+            return {"missing": True}
+        gen = nm_fields(run_cmd([NMCLI, "-t", "-f", "NETWORKING,WIFI,CONNECTIVITY", "general"]))
+        gen += [""] * (3 - len(gen))
+        st = {
+            "networking": gen[0] == "enabled",
+            "wifi": gen[1] == "enabled",
+            "connectivity": gen[2],
+            "items": [],
+            "dev": "",
+            "conn": "",
+            "ip": "",
+        }
+
+        devices = []
+        for ln in run_cmd([NMCLI, "-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "device"]).splitlines():
+            f = nm_fields(ln)
+            if len(f) >= 4:
+                devices.append({"dev": f[0], "type": f[1], "state": f[2], "conn": f[3]})
+        st["has_wifi"] = any(d["type"] == "wifi" for d in devices)
+
+        conns = []
+        for ln in run_cmd([NMCLI, "-t", "-f", "NAME,UUID,TYPE,DEVICE,ACTIVE", "connection", "show"]).splitlines():
+            f = nm_fields(ln)
+            if len(f) >= 5:
+                conns.append({"name": f[0], "uuid": f[1], "type": f[2], "dev": f[3], "active": f[4] == "yes"})
+
+        # The link that carries traffic: active ethernet first, then Wi-Fi
+        for typ in ("ethernet", "wifi"):
+            d = next((d for d in devices if d["type"] == typ and d["state"] == "connected"), None)
+            if d:
+                st["dev"], st["conn"] = d["dev"], d["conn"]
+                ips = run_cmd([NMCLI, "-g", "IP4.ADDRESS", "device", "show", d["dev"]])
+                st["ip"] = ips.split(" | ")[0]
+                break
+
+        items = []
+        eth_devs = [d for d in devices if d["type"] == "ethernet"]
+        for c in conns:
+            if c["type"] == "802-3-ethernet":
+                if c["active"]:
+                    sub = f"{c['dev']}  •  connected"
+                elif eth_devs and all(d["state"] == "unavailable" for d in eth_devs):
+                    sub = "cable unplugged"
+                else:
+                    sub = "wired"
+                items.append({"kind": "wired", "name": c["name"], "uuid": c["uuid"], "active": c["active"],
+                              "saved": True, "sub": sub, "signal": 101})
+            elif c["type"] in ("vpn", "wireguard"):
+                items.append({"kind": "vpn", "name": c["name"], "uuid": c["uuid"], "active": c["active"],
+                              "saved": True, "sub": c["type"].upper(), "signal": 100})
+
+        # Saved Wi-Fi profiles by SSID (profile name can differ from the SSID)
+        saved = {}
+        for c in conns:
+            if c["type"] == "802-11-wireless":
+                ssid = run_cmd([NMCLI, "-g", "802-11-wireless.ssid", "connection", "show", "uuid", c["uuid"]])
+                ssid = re.sub(r"\\(.)", r"\1", ssid) or c["name"]
+                # an active profile wins over another saved one for the same SSID
+                if ssid not in saved or c["active"]:
+                    saved[ssid] = c
+
+        if st["wifi"] and st["networking"]:
+            nets = {}
+            out = run_cmd([NMCLI, "-t", "-f", "IN-USE,SSID,SIGNAL,SECURITY", "device", "wifi", "list", "--rescan", "no"], timeout=6)
+            for ln in out.splitlines():
+                f = nm_fields(ln)
+                if len(f) < 4 or not f[1]:
+                    continue  # hidden networks have no SSID
+                in_use, ssid, sec = f[0] == "*", f[1], f[3].strip().replace("--", "")
+                sig = int(f[2]) if f[2].isdigit() else 0
+                n = nets.setdefault(ssid, {"signal": 0, "in_use": False, "sec": sec})
+                # one row per SSID: strongest band / access point
+                n["signal"] = max(n["signal"], sig)
+                n["in_use"] = n["in_use"] or in_use
+            for ssid, n in nets.items():
+                prof = saved.get(ssid)
+                active = n["in_use"] or bool(prof and prof["active"])
+                meta = [f"{n['signal']}%", n["sec"] or "open"]
+                if prof:
+                    meta.append("saved")
+                items.append({"kind": "wifi", "name": ssid, "uuid": prof["uuid"] if prof else "",
+                              "active": active, "saved": bool(prof), "secure": bool(n["sec"]),
+                              "sub": "  •  ".join(meta), "signal": n["signal"]})
+
+        items.sort(key=lambda i: (not i["active"], not i["saved"], -i["signal"], i["name"].lower()))
+        st["items"] = items
+        return st
+
+    def refresh_network(self):
+        if self.net_querying:
+            self.net_requery = True
+            return
+        self.net_querying = True
+
+        def _worker():
+            st = self.query_network_state()
+            GLib.idle_add(self._apply_network_state, st)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _apply_network_state(self, st):
+        self.net_querying = False
+        self.net_state = st
+        self.net_items = st.get("items", [])
+        if self.net_sel >= len(self.net_items):
+            self.net_sel = max(0, len(self.net_items) - 1)
+        if self.net_state.get("dev") != (self.net_rate_prev or ("",))[0]:
+            self.net_rate_prev = None
+        self.render_network()
+        self.update_net_rate()
+        if self.net_requery:
+            self.net_requery = False
+            self.refresh_network()
+        return False
+
+    def _set_net_btn(self, btn, text, on):
+        ctx = btn.get_style_context()
+        ctx.remove_class("mono-btn")
+        ctx.remove_class("mono-btn-active")
+        ctx.add_class("mono-btn-active" if on else "mono-btn")
+        btn.set_label(text)
+
+    def render_network(self):
+        st = self.net_state
+        for child in self.net_list_box.get_children():
+            self.net_list_box.remove(child)
+
+        if st.get("missing"):
+            self.net_info_lbl.set_text("nmcli not found (NetworkManager)")
+            self.net_rate_lbl.set_text("sudo pacman -S networkmanager")
+            for b in (self.net_power_btn, self.net_wifi_btn, self.net_scan_btn):
+                b.set_sensitive(False)
+            return
+
+        self._set_net_btn(self.net_power_btn, f"[I] INTERNET: {'ON' if st.get('networking') else 'OFF'}",
+                          st.get("networking"))
+        self._set_net_btn(self.net_wifi_btn, f"[W] WI-FI: {'ON' if st.get('wifi') else 'OFF'}", st.get("wifi"))
+        self.net_wifi_btn.set_visible(st.get("has_wifi", True))
+        if not self.net_scanning:
+            self.net_scan_btn.set_label("[S] SCAN")
+
+        if not st.get("networking"):
+            self.net_info_lbl.set_text("NETWORKING DISABLED")
+        elif st.get("dev"):
+            conn = st.get("connectivity", "")
+            tag = {"full": "ONLINE", "limited": "LIMITED", "portal": "LOGIN PAGE", "none": "NO INTERNET"}.get(conn, conn.upper())
+            parts = [st["dev"], st["conn"], st["ip"].split("/")[0], tag]
+            self.net_info_lbl.set_text("  •  ".join(p for p in parts if p))
+        else:
+            self.net_info_lbl.set_text("DISCONNECTED")
+
+        if not self.net_items:
+            msg = "networking is off" if not st.get("networking") else (
+                "wi-fi is off" if not st.get("wifi") else "no networks – [S] to scan")
+            lbl = Gtk.Label(label=msg)
+            lbl.get_style_context().add_class("row-sub")
+            lbl.set_xalign(0)
+            self.net_list_box.pack_start(lbl, False, False, 6)
+
+        for idx, it in enumerate(self.net_items):
+            ev = Gtk.EventBox()
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            row.get_style_context().add_class("item-row-selected" if idx == self.net_sel else "item-row")
+            ev.add(row)
+
+            vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            kind = {"wired": "[ETH] ", "vpn": "[VPN] ", "wifi": ""}[it["kind"]]
+            tag = "[CONNECTED] " if it["active"] else ""
+            lbl = Gtk.Label(label=f"{tag}{kind}{it['name']}")
+            lbl.get_style_context().add_class("row-title")
+            lbl.set_xalign(0)
+            lbl.set_ellipsize(Pango.EllipsizeMode.END)
+            vbox.pack_start(lbl, False, False, 0)
+            sub = Gtk.Label(label=it["sub"])
+            sub.get_style_context().add_class("row-sub")
+            sub.set_xalign(0)
+            sub.set_ellipsize(Pango.EllipsizeMode.END)
+            vbox.pack_start(sub, False, False, 0)
+            row.pack_start(vbox, True, True, 0)
+
+            act_btn = Gtk.Button(label="[DISCONNECT]" if it["active"] else "[CONNECT]")
+            act_btn.get_style_context().add_class("mono-btn-active" if it["active"] else "mono-btn")
+            act_btn.connect("clicked", lambda _w, i=idx: self.activate_net_item(i))
+            row.pack_end(act_btn, False, False, 0)
+            if it["kind"] == "wifi" and it["saved"]:
+                fg_btn = Gtk.Button(label="[F]")
+                fg_btn.get_style_context().add_class("mono-btn")
+                fg_btn.set_tooltip_text("Forget this network (press twice)")
+                fg_btn.connect("clicked", lambda _w, i=idx: self.forget_net_item(i))
+                row.pack_end(fg_btn, False, False, 0)
+
+            ev.connect("button-press-event", self.on_net_row_click, idx)
+            self.net_list_box.pack_start(ev, False, False, 0)
+
+        self.net_list_box.show_all()
+        scroll_row_into_view(self.net_scroll, self.net_list_box, self.net_sel)
+
+    def update_net_rate(self):
+        # Live throughput of the active link from kernel counters – two file reads, no subprocess
+        dev = self.net_state.get("dev")
+        if not dev:
+            self.net_rate_lbl.set_text("")
+            self.net_rate_prev = None
+            return
+        try:
+            base = Path("/sys/class/net") / dev / "statistics"
+            rx = int((base / "rx_bytes").read_text())
+            tx = int((base / "tx_bytes").read_text())
+        except Exception:
+            self.net_rate_lbl.set_text("")
+            return
+        now = time.monotonic()
+        prev = self.net_rate_prev
+        self.net_rate_prev = (dev, now, rx, tx)
+        if prev and prev[0] == dev and now > prev[1]:
+            dt = now - prev[1]
+            self.net_rate_lbl.set_text(
+                f"DOWN {fmt_rate(max(0, rx - prev[2]) / dt)}   UP {fmt_rate(max(0, tx - prev[3]) / dt)}"
+            )
+        elif not self.net_rate_lbl.get_text():
+            self.net_rate_lbl.set_text("DOWN --   UP --")
+
+    def select_net_row(self, idx):
+        if self.net_items:
+            self.net_sel = idx % len(self.net_items)
+            self.render_network()
+
+    def on_net_row_click(self, _widget, event, idx):
+        self.focus_tile("network")
+        self.net_sel = idx
+        self.render_network()
+        if event.type == Gdk.EventType._2BUTTON_PRESS:
+            self.activate_net_item(idx)
+        return True
+
+    def run_net_action(self, args, label):
+        if not NMCLI:
+            return
+        if self.net_action_busy:
+            self.set_status("NETWORK: PREVIOUS ACTION STILL RUNNING")
+            return
+        self.net_action_busy = True
+        self.set_status(f"{label}...")
+
+        def _worker():
+            # connecting can take a while (DHCP, WPA handshake), so it never runs on the main thread
+            try:
+                res = subprocess.run([NMCLI, "--wait", "25", *args], capture_output=True, text=True,
+                                     timeout=35, stdin=subprocess.DEVNULL)
+                ok, msg = res.returncode == 0, (res.stderr.strip() or res.stdout.strip())
+            except Exception as e:
+                ok, msg = False, str(e)
+            GLib.idle_add(self._finish_net_action, label, ok, msg)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _finish_net_action(self, label, ok, msg):
+        self.net_action_busy = False
+        if ok:
+            self.set_status(f"{label}: OK")
+        else:
+            last = (msg.splitlines() or ["failed"])[-1]
+            if "Secrets were required" in msg or "802-11-wireless-security" in msg:
+                last = "wrong or missing password"
+            self.set_status(f"{label}: {last[:70]}")
+        self.refresh_network()
+        return False
+
+    def toggle_networking(self):
+        if not self.net_state or self.net_state.get("missing"):
+            return
+        on = not self.net_state.get("networking")
+        self.run_net_action(["networking", "on" if on else "off"], f"INTERNET {'ON' if on else 'OFF'}")
+
+    def toggle_wifi(self):
+        if not self.net_state or self.net_state.get("missing") or not self.net_state.get("has_wifi", True):
+            return
+        on = not self.net_state.get("wifi")
+        self.run_net_action(["radio", "wifi", "on" if on else "off"], f"WI-FI {'ON' if on else 'OFF'}")
+
+    def trigger_net_scan(self):
+        if not NMCLI or self.net_scanning or not self.net_state.get("wifi"):
+            return
+        self.net_scanning = True
+        self.net_scan_btn.set_label("[SCANNING...]")
+        self.set_status("WI-FI SCANNING...")
+
+        def _worker():
+            # --rescan yes waits for the scan to finish before listing
+            run_cmd([NMCLI, "device", "wifi", "list", "--rescan", "yes"], timeout=20)
+            GLib.idle_add(self._finish_net_scan)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _finish_net_scan(self):
+        self.net_scanning = False
+        self.net_scan_btn.set_label("[S] SCAN")
+        self.set_status("WI-FI SCAN COMPLETE")
+        self.refresh_network()
+        return False
+
+    def activate_net_item(self, idx=None):
+        self.focus_tile("network")
+        if not self.net_items:
+            return
+        idx = self.net_sel if idx is None else idx
+        self.net_sel = idx
+        it = self.net_items[idx]
+        name = it["name"]
+        if it["active"]:
+            if it["uuid"]:
+                self.run_net_action(["connection", "down", "uuid", it["uuid"]], f"DISCONNECT {name}")
+            return
+        if it["uuid"]:
+            self.run_net_action(["connection", "up", "uuid", it["uuid"]], f"CONNECT {name}")
+        elif it.get("secure"):
+            self.open_net_password(name)
+        else:
+            self.run_net_action(["device", "wifi", "connect", name], f"CONNECT {name}")
+
+    def forget_net_item(self, idx=None):
+        self.focus_tile("network")
+        if not self.net_items:
+            return
+        idx = self.net_sel if idx is None else idx
+        it = self.net_items[idx]
+        if it["kind"] != "wifi" or not it["uuid"]:
+            self.set_status("NOTHING TO FORGET")
+            return
+        # Forgetting drops the saved password, so it takes a second press within 3 s
+        pend_uuid, pend_t = self.net_forget_pending
+        if pend_uuid == it["uuid"] and time.monotonic() - pend_t < 3:
+            self.net_forget_pending = (None, 0.0)
+            self.run_net_action(["connection", "delete", "uuid", it["uuid"]], f"FORGET {it['name']}")
+        else:
+            self.net_forget_pending = (it["uuid"], time.monotonic())
+            self.set_status(f"PRESS F AGAIN TO FORGET {it['name']}")
+
+    def open_net_password(self, ssid):
+        self.net_pw_ssid = ssid
+        self.net_pw_lbl.set_text(f"PASSWORD FOR {ssid}:")
+        self.net_pw_entry.set_text("")
+        self.net_pw_box.show_all()
+        self.net_pw_entry.grab_focus()
+        self.set_status(f"ENTER PASSWORD FOR {ssid}")
+
+    def cancel_net_password(self):
+        if self.net_pw_ssid is None:
+            return
+        self.net_pw_ssid = None
+        self.net_pw_entry.set_text("")
+        self.net_pw_box.hide()
+        if self.win is not None:
+            self.win.set_focus(None)
+
+    def submit_net_password(self):
+        ssid, pw = self.net_pw_ssid, self.net_pw_entry.get_text()
+        if ssid is None:
+            return
+        if len(pw) < 8:
+            self.set_status("WPA PASSWORD NEEDS AT LEAST 8 CHARACTERS")
+            return
+        self.cancel_net_password()
+        # NetworkManager saves the new profile (password included, root-only) for next time
+        self.run_net_action(["device", "wifi", "connect", ssid, "password", pw], f"CONNECT {ssid}")
+
     # ---------------- BRIGHTNESS (DDC/CI) LOGIC ----------------
     def parse_ddc_detect(self, out):
         displays = []
@@ -2953,6 +3427,8 @@ class CommandCenterApp:
         return True
 
     def focus_tile(self, tile_id: str):
+        if tile_id != "network":
+            self.cancel_net_password()
         if tile_id in self.tile_order:
             self.search_active = False
             self.focused_tile_idx = self.tile_order.index(tile_id)
@@ -2995,7 +3471,7 @@ class CommandCenterApp:
         if self.search_active:
             if not self.launch_entry.has_focus():
                 self.launch_entry.grab_focus_without_selecting()
-        elif self.win is not None:
+        elif self.win is not None and self.net_pw_ssid is None:
             self.win.set_focus(None)
 
         self.fixed.queue_draw()
@@ -3014,12 +3490,31 @@ class CommandCenterApp:
             return True
         self.refresh_system()
         self.poll_audio()
+        self.update_net_rate()
+        # Wi-Fi list / link state is a few nmcli calls – every 10 s is plenty
+        self.net_ticks += 1
+        if self.net_ticks % 5 == 0:
+            self.refresh_network()
         return True
 
     def on_key_press(self, _widget, event):
         key = Gdk.keyval_name(event.keyval) or ""
         ctrl = bool(event.state & Gdk.ModifierType.CONTROL_MASK)
         alt = bool(event.state & Gdk.ModifierType.MOD1_MASK)
+
+        # Wi-Fi password prompt owns the keyboard: Enter joins, Esc cancels, Tab leaves it,
+        # everything else goes to the entry (no tile hotkeys while typing a password)
+        if self.net_pw_ssid is not None:
+            if key == "Escape":
+                self.cancel_net_password()
+                self.set_status("CANCELLED")
+                return True
+            if key in ("Return", "KP_Enter"):
+                self.submit_net_password()
+                return True
+            if key not in ("Tab", "ISO_Left_Tab"):
+                return False
+            self.cancel_net_password()
 
         # Super+Tab is normally consumed by the Hyprland bind; handle it here too in case it gets through
         if key == "Escape" or (key in ("Tab", "ISO_Left_Tab") and event.state & Gdk.ModifierType.SUPER_MASK):
@@ -3197,6 +3692,29 @@ class CommandCenterApp:
                 return True
             if key in ("g", "G"):
                 self.toggle_rgb()
+                return True
+
+        elif active_tile_id == "network":
+            if key in ("Down", "j", "J"):
+                self.select_net_row(self.net_sel + 1)
+                return True
+            if key in ("Up", "k", "K"):
+                self.select_net_row(self.net_sel - 1)
+                return True
+            if key in ("Return", "KP_Enter", "space"):
+                self.activate_net_item()
+                return True
+            if key in ("i", "I"):
+                self.toggle_networking()
+                return True
+            if key in ("w", "W"):
+                self.toggle_wifi()
+                return True
+            if key in ("s", "S"):
+                self.trigger_net_scan()
+                return True
+            if key in ("f", "F", "Delete"):
+                self.forget_net_item()
                 return True
 
         return False

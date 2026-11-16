@@ -3,7 +3,7 @@
 Pełnoekranowy HUD dla **Hyprlanda** (GTK3 + gtk-layer-shell) w terminalowym, czarno-białym stylu. SUPER+TAB go otwiera, drugie SUPER+TAB albo Esc zamyka.
 
 - **wyszukiwarka aplikacji** w stylu Spotlight (zaczynasz pisać, strzałki wybierają, Enter uruchamia),
-- kafelki: **audio** (wyjścia i głośność aplikacji), **jasność** monitorów (DDC/CI) i przełącznik **HDR** (`[T]`, wymaga `hdr.sh` z [hypr](https://github.com/K-u-r-c/hypr)), **Bluetooth**, **zrzuty ekranu**, **tapety**, **system** (CPU, RAM, GPU, VRAM, dysk i liczba aktualizacji przez `checkupdates` + `paru`),
+- kafelki: **audio** (wyjścia i głośność aplikacji), **jasność** monitorów (DDC/CI) i przełącznik **HDR** (`[T]`, wymaga `hdr.sh` z [hypr](https://github.com/K-u-r-c/hypr)), **Bluetooth**, **zrzuty ekranu**, **tapety**, **system** (CPU, RAM, GPU, VRAM, dysk, liczba aktualizacji przez `checkupdates` + `paru` i przełącznik RGB `[G]`, jeśli jest `~/.local/bin/rgb-mode`), **sieć** (NetworkManager: internet `[I]` i Wi-Fi `[W]` wł./wył., skanowanie `[S]`, łączenie z sieciami Wi-Fi z hasłem wpisywanym w kafelku, przewodowe i VPN, zapomnienie sieci `[F]`, adres, stan połączenia i bieżący transfer),
 - kafelki da się przeciągać, a układ zapisuje się osobno dla każdej rozdzielczości.
 
 Działa jako demon (`--daemon`), więc otwiera się od razu, bez mignięcia.
@@ -14,7 +14,7 @@ Działa jako demon (`--daemon`), więc otwiera się od razu, bez mignięcia.
 
 ```bash
 # zależności (Arch / CachyOS)
-sudo pacman -S --needed python-gobject gtk3 gtk-layer-shell libpulse bluez-utils ffmpeg wl-clipboard xdg-utils
+sudo pacman -S --needed python-gobject gtk3 gtk-layer-shell libpulse bluez-utils ffmpeg wl-clipboard xdg-utils networkmanager
 # opcjonalnie: jasność monitorów i licznik aktualizacji
 sudo pacman -S --needed ddcutil pacman-contrib && echo i2c-dev | sudo tee /etc/modules-load.d/i2c-dev.conf
 
