@@ -65,6 +65,8 @@ TILE_PREFS = {
 WALL_SCRIPT = HOME / ".config/hypr/wallpaper.sh"
 # HDR toggle in the brightness tile needs hdr.sh from the same repo; without it the button is hidden
 HDR_SCRIPT = HOME / ".config/hypr/hdr.sh"
+# RGB toggle in the system tile (rainbow / off via OpenRGB profiles); without it the button is hidden
+RGB_SCRIPT = HOME / ".local/bin/rgb-mode"
 WALL_DIR = HOME / "Pictures/wallpapers"
 THUMB_DIR = HOME / ".cache/wallpaper-thumbs"
 SHOT_THUMB_DIR = HOME / ".cache/screenshot-thumbs"
@@ -820,6 +822,7 @@ class CommandCenterApp:
         self.bright_reading = False
         self.hdr_state = None
         self.hdr_busy = False
+        self.rgb_busy = False
 
         self.sys_busy = False
         self.sys_rows = {}
@@ -878,6 +881,7 @@ class CommandCenterApp:
             self.refresh_audio,
             self.refresh_brightness,
             self.refresh_hdr,
+            self.refresh_rgb,
             self.refresh_bluetooth,
             self.refresh_screenshots,
             self.refresh_wallpapers,
@@ -1511,6 +1515,12 @@ class CommandCenterApp:
         self.sys_update_btn.get_style_context().add_class("mono-btn")
         self.sys_update_btn.connect("clicked", lambda *_: self.run_system_update())
         sys_bar.pack_start(self.sys_update_btn, True, True, 0)
+        self.rgb_btn = Gtk.Button(label="[G] RGB --")
+        self.rgb_btn.get_style_context().add_class("mono-btn")
+        self.rgb_btn.set_tooltip_text("RGB: rainbow / off (rgb-mode, OpenRGB)")
+        self.rgb_btn.connect("clicked", lambda *_: (self.focus_tile("system"), self.toggle_rgb()))
+        self.rgb_btn.set_no_show_all(True)
+        sys_bar.pack_start(self.rgb_btn, True, True, 0)
         t_sys.body.pack_start(sys_bar, False, False, 0)
 
         self.sys_scroll = Gtk.ScrolledWindow()
@@ -2514,6 +2524,49 @@ class CommandCenterApp:
             self.set_status(f"HDR {state.upper()}" if known else f"HDR: {(err.splitlines() or ['failed'])[-1][:60]}")
         return False
 
+    def refresh_rgb(self):
+        # status is just the remembered choice (a file read) – no OpenRGB run, so it's instant
+        if not RGB_SCRIPT.exists():
+            self.rgb_btn.hide()
+            return
+        if not self.rgb_busy:
+            self._set_rgb_label(run_cmd([str(RGB_SCRIPT), "status"]))
+
+    def _set_rgb_label(self, state):
+        self.rgb_btn.set_label({"rainbow": "[G] RGB ON", "off": "[G] RGB OFF"}.get(state, "[G] RGB --"))
+        self.rgb_btn.show()
+
+    def toggle_rgb(self):
+        if self.rgb_busy or not RGB_SCRIPT.exists():
+            return
+        self.rgb_busy = True
+        self.rgb_btn.set_label("[G] RGB ...")
+        self.set_status("SWITCHING RGB...")
+
+        def _worker():
+            # OpenRGB detects the hardware on every run (~3-4 s), so this stays off the main thread
+            try:
+                res = subprocess.run([str(RGB_SCRIPT), "toggle"], capture_output=True, text=True, timeout=40)
+                out, err = res.stdout.strip(), res.stderr.strip()
+            except Exception as e:
+                out, err = "", str(e)
+            GLib.idle_add(self._finish_rgb, out, err)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _finish_rgb(self, out, err):
+        self.rgb_busy = False
+        state = out.splitlines()[-1] if out else ""
+        if state in ("rainbow", "off"):
+            self._set_rgb_label(state)
+            # a warning (e.g. the pump not answering) is worth more than the plain confirmation
+            warn = err.splitlines()[-1][:60] if err else ""
+            self.set_status(f"RGB: {warn}" if warn else ("RGB RAINBOW" if state == "rainbow" else "RGB OFF"))
+        else:
+            self._set_rgb_label(run_cmd([str(RGB_SCRIPT), "status"]))
+            self.set_status(f"RGB: {(err.splitlines() or ['failed'])[-1][:60]}")
+        return False
+
     def refresh_brightness(self):
         if self.bright_displays:
             self.read_brightness()
@@ -3141,6 +3194,9 @@ class CommandCenterApp:
                 return True
             if key in ("u", "U"):
                 self.run_system_update()
+                return True
+            if key in ("g", "G"):
+                self.toggle_rgb()
                 return True
 
         return False
